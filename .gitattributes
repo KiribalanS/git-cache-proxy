@@ -6,3 +6,10 @@
 Dockerfile text eol=lf
 *.conf  text eol=lf
 docker-compose.yml text eol=lf
+
+# .env is parsed line-by-line by Docker's env_file directive, which does not
+# strip \r -- a CRLF checkout here would silently append a trailing \r onto
+# the PAT/username values themselves, corrupting the credential without any
+# visible error.
+.env         text eol=lf
+.env.example text eol=lf

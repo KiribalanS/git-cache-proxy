@@ -82,29 +82,52 @@ if echo "$PATH_INFO" | grep -q "/git-upload-pack$" && [ "${GIT_CACHE_PACK_CACHE_
     BODY_HASH=$(sha256sum "$BODY_FILE" | cut -d' ' -f1)
     PACK_CACHE_DIR="/repo-cache/.pack-cache/${REPO_HASH}"
     PACK_CACHE_ENTRY="${PACK_CACHE_DIR}/${BODY_HASH}"
+    PACK_CACHE_LOCK="${PACK_CACHE_DIR}/${BODY_HASH}.lock"
 
     if [ ! -f "$PACK_CACHE_ENTRY" ]; then
         mkdir -p "$PACK_CACHE_DIR"
         # Opportunistic cleanup, scoped to this one repo's cache dir only --
-        # bounded cost, only runs on a miss (i.e. rarely, once warm).
-        find "$PACK_CACHE_DIR" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null
+        # bounded cost, only runs on a miss (i.e. rarely, once warm). Default
+        # 240min (4h): most of the sharing benefit happens in the first few
+        # minutes after a push (the concurrent CI burst that actually hits
+        # it), not a day later -- a short window bounds worst-case storage
+        # without giving up much real cache-hit potential.
+        find "$PACK_CACHE_DIR" -maxdepth 1 -type f -mmin "+${GIT_CACHE_PACK_CACHE_RETENTION_MIN:-240}" -delete 2>/dev/null
 
-        # On a miss, fully buffer git-http-backend's output to disk and
-        # check its exit code *before* the entry is published or served --
-        # never stream-while-caching, which risks persisting a truncated
-        # pack if a client disconnects mid-transfer (a corrupted shared
-        # cache entry would break every *other* client's clone too,
-        # silently, until it ages out -- worse than no cache at all).
-        PACK_CACHE_TMP=$(mktemp "${PACK_CACHE_DIR}/.tmp.XXXXXX")
-        if /usr/libexec/git-core/git-http-backend < "$BODY_FILE" > "$PACK_CACHE_TMP"; then
-            mv -f "$PACK_CACHE_TMP" "$PACK_CACHE_ENTRY"
-        else
-            echo "pack cache miss failed for $REPO_URL hash=$BODY_HASH" >> "$PROGRESS_LOG"
-            rm -f "$PACK_CACHE_TMP" "$BODY_FILE"
+        # Locked per-negotiation, not just per-repo: without this, N
+        # *simultaneous first* requests for the identical negotiation (e.g. a
+        # push that fires N CI pipelines against the same new commit at
+        # once) would each independently see a miss and each independently
+        # pay the full pack-generation cost instead of sharing it -- the
+        # cache would provide zero benefit for exactly the burst scenario it
+        # exists for. Double-checked locking: re-check existence *after*
+        # acquiring the lock, since another request may have just finished
+        # populating it while this one waited.
+        (
+            flock -x 201
+            if [ ! -f "$PACK_CACHE_ENTRY" ]; then
+                # On a miss, fully buffer git-http-backend's output to disk
+                # and check its exit code *before* the entry is published or
+                # served -- never stream-while-caching, which risks
+                # persisting a truncated pack if a client disconnects
+                # mid-transfer (a corrupted shared cache entry would break
+                # every *other* client's clone too, silently, until it ages
+                # out -- worse than no cache at all).
+                PACK_CACHE_TMP=$(mktemp "${PACK_CACHE_DIR}/.tmp.XXXXXX")
+                if /usr/libexec/git-core/git-http-backend < "$BODY_FILE" > "$PACK_CACHE_TMP"; then
+                    mv -f "$PACK_CACHE_TMP" "$PACK_CACHE_ENTRY"
+                else
+                    echo "pack cache miss failed for $REPO_URL hash=$BODY_HASH" >> "$PROGRESS_LOG"
+                    rm -f "$PACK_CACHE_TMP"
+                    exit 1
+                fi
+            fi
+        ) 201>"$PACK_CACHE_LOCK" || {
+            rm -f "$BODY_FILE"
             echo "Status: 502 Bad Gateway"
             echo
             exit 0
-        fi
+        }
     fi
 
     rm -f "$BODY_FILE"
