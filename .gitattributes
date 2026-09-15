@@ -1,0 +1,8 @@
+# These files run unmodified inside a Linux/Alpine container. A CRLF
+# checkout (e.g. Windows core.autocrlf=true) breaks the shebang lines and
+# every here-doc/heredoc-sensitive parsing in them, so force LF regardless
+# of the checking-out machine's line-ending settings.
+*.sh    text eol=lf
+Dockerfile text eol=lf
+*.conf  text eol=lf
+docker-compose.yml text eol=lf
